@@ -45,6 +45,8 @@ const (
 	DefaultCheckpointInterval = 10 * time.Second
 	// DefaultCheckpointRepublishInterval is used by storage implementations if no WithCheckpointRepublishInterval option is provided when instantiating it.
 	DefaultCheckpointRepublishInterval = 10 * time.Minute
+	// DefaultStatsInterval is used by storage implementations if no WithStatsInterval option is provided when instantiating it.
+	DefaultStatsInterval = 100 * time.Millisecond
 	// DefaultPushbackMaxOutstanding is used by storage implementations if no WithPushback option is provided when instantiating it.
 	DefaultPushbackMaxOutstanding = 4096
 	// DefaultGarbageCollectionInterval is the default value used if no WithGarbageCollectionInterval option is provided.
@@ -279,7 +281,9 @@ func NewAppender(ctx context.Context, d Driver, opts *AppendOptions) (*Appender,
 		go f.Follow(ctx, r)
 		go followerStats(ctx, f, r.IntegratedSize)
 	}
-	go sd.updateStats(ctx, r)
+	if opts.statsInterval > 0 {
+		go sd.updateStats(ctx, r, opts.statsInterval)
+	}
 	t := terminator{
 		delegate:       a.Add,
 		readCheckpoint: r.ReadCheckpoint,
@@ -394,16 +398,20 @@ func (i *integrationStats) latency(size uint64) (time.Duration, bool) {
 	return 0, false
 }
 
-// updateStates periodically checks the current integrated tree size and attempts to
+// updateStats periodically checks the current integrated tree size and attempts to
 // consume any held sample, updating the metric if possible.
 //
-// This is a long running function, exitingly only when the provided context is done.
-func (i *integrationStats) updateStats(ctx context.Context, r LogReader) {
+// interval must be greater than zero. Each tick issues one IntegratedSize and one
+// NextIndex call to r.
+//
+// This is a long running function, exiting only when the provided context is done.
+func (i *integrationStats) updateStats(ctx context.Context, r LogReader, interval time.Duration) {
 	if r == nil {
-		klog.Warning("updateStates: nil logreader provided, not updating stats")
+		klog.Warning("updateStats: nil logreader provided, not updating stats")
 		return
 	}
-	t := time.NewTicker(100 * time.Millisecond)
+	t := time.NewTicker(interval)
+	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -564,6 +572,7 @@ func NewAppendOptions() *AppendOptions {
 		bundleIDHasher:              defaultIDHasher,
 		checkpointInterval:          DefaultCheckpointInterval,
 		checkpointRepublishInterval: DefaultCheckpointRepublishInterval,
+		statsInterval:               DefaultStatsInterval,
 		addDecorators:               make([]func(AddFn) AddFn, 0),
 		pushbackMaxOutstanding:      DefaultPushbackMaxOutstanding,
 		garbageCollectionInterval:   DefaultGarbageCollectionInterval,
@@ -597,6 +606,10 @@ type AppendOptions struct {
 
 	checkpointInterval          time.Duration
 	checkpointRepublishInterval time.Duration
+
+	// statsInterval is the period between log state polls made to update appender metrics.
+	// Zero or less disables those polls.
+	statsInterval time.Duration
 
 	witnesses   WitnessGroup
 	witnessOpts WitnessOptions
@@ -825,6 +838,24 @@ func (o *AppendOptions) WithCheckpointInterval(interval time.Duration) *AppendOp
 // Setting this less than or equal to zero will disable republication of unchanged checkpoints.
 func (o *AppendOptions) WithCheckpointRepublishInterval(interval time.Duration) *AppendOptions {
 	o.checkpointRepublishInterval = interval
+	return o
+}
+
+// WithStatsInterval configures how frequently Tessera polls the log state in order to update the
+// tessera.appender.integrated.size, tessera.appender.next_index, and tessera.appender.integrate.latency
+// metrics.
+//
+// Each poll issues one IntegratedSize and one NextIndex call to the LogReader, independent of the rate
+// at which entries are added, and continuing while the log is idle. For database-backed storage
+// implementations that is two queries per interval per appender. Integration latency is not resolved
+// more finely than the interval.
+//
+// Zero or less disables the polling, leaving the three metrics above unpopulated. Metrics recorded on
+// the Add path are unaffected.
+//
+// If this option isn't provided, storage implementations will use the DefaultStatsInterval const above.
+func (o *AppendOptions) WithStatsInterval(interval time.Duration) *AppendOptions {
+	o.statsInterval = interval
 	return o
 }
 

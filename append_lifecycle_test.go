@@ -16,7 +16,9 @@ package tessera
 
 import (
 	"context"
+	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -138,6 +140,138 @@ func TestMaxEntrySize(t *testing.T) {
 				t.Fatalf("Got err %q, want err? %T", err, test.wantErr)
 			}
 		})
+	}
+}
+
+func TestAppendOptionsStatsInterval(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		opts *AppendOptions
+		want time.Duration
+	}{
+		{
+			name: "Default",
+			opts: NewAppendOptions(),
+			want: DefaultStatsInterval,
+		}, {
+			name: "Explicit",
+			opts: NewAppendOptions().WithStatsInterval(30 * time.Second),
+			want: 30 * time.Second,
+		}, {
+			name: "Zero disables",
+			opts: NewAppendOptions().WithStatsInterval(0),
+			want: 0,
+		}, {
+			name: "Negative disables",
+			opts: NewAppendOptions().WithStatsInterval(-time.Second),
+			want: -time.Second,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.opts.statsInterval; got != test.want {
+				t.Fatalf("Got statsInterval %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+// countingLogReader records the number of polling calls updateStats makes, and signals the
+// first IntegratedSize call on polled.
+type countingLogReader struct {
+	integratedSize atomic.Int64
+	nextIndex      atomic.Int64
+	polled         chan struct{}
+}
+
+func (r *countingLogReader) IntegratedSize(_ context.Context) (uint64, error) {
+	r.integratedSize.Add(1)
+	select {
+	case r.polled <- struct{}{}:
+	default:
+	}
+	return 0, nil
+}
+
+func (r *countingLogReader) NextIndex(_ context.Context) (uint64, error) {
+	r.nextIndex.Add(1)
+	return 0, nil
+}
+
+func (r *countingLogReader) ReadCheckpoint(_ context.Context) ([]byte, error) {
+	return nil, os.ErrNotExist
+}
+
+func (r *countingLogReader) ReadTile(_ context.Context, _, _ uint64, _ uint8) ([]byte, error) {
+	return nil, os.ErrNotExist
+}
+
+func (r *countingLogReader) ReadEntryBundle(_ context.Context, _ uint64, _ uint8) ([]byte, error) {
+	return nil, os.ErrNotExist
+}
+
+func TestUpdateStatsPolls(t *testing.T) {
+	r := &countingLogReader{polled: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		(&integrationStats{}).updateStats(ctx, r, time.Millisecond)
+		close(done)
+	}()
+
+	select {
+	case <-r.polled:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Timed out waiting for updateStats to poll the log reader")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("updateStats did not return after its context was cancelled")
+	}
+
+	if got := r.integratedSize.Load(); got == 0 {
+		t.Error("Got 0 IntegratedSize calls, want at least one")
+	}
+	if got := r.nextIndex.Load(); got == 0 {
+		t.Error("Got 0 NextIndex calls, want at least one")
+	}
+}
+
+// TestRegressionUpdateStatsHonoursInterval pins the poll period to the configured interval.
+// A hardcoded period polls repeatedly inside the window this leaves silent.
+func TestRegressionUpdateStatsHonoursInterval(t *testing.T) {
+	r := &countingLogReader{polled: make(chan struct{}, 1)}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go (&integrationStats{}).updateStats(ctx, r, time.Hour)
+
+	select {
+	case <-r.polled:
+		t.Fatal("Got a poll before the configured interval elapsed, want none")
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	if got := r.integratedSize.Load(); got != 0 {
+		t.Errorf("Got %d IntegratedSize calls before the interval elapsed, want 0", got)
+	}
+}
+
+func TestUpdateStatsNilLogReader(t *testing.T) {
+	done := make(chan struct{})
+	go func() {
+		(&integrationStats{}).updateStats(t.Context(), nil, time.Millisecond)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("updateStats did not return for a nil LogReader")
 	}
 }
 
