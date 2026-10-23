@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   govulncheck_job:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     name: Run govulncheck
     steps:
       - id: govulncheck

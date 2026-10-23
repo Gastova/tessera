@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   generatedfiles_job:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     name: Regenerate derived files
     steps:
       - name: Check out the repository to the runner
